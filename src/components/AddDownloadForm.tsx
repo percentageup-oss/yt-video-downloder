@@ -50,7 +50,7 @@ export function AddDownloadForm({ ytdlpInstalled, onAdded }: AddDownloadFormProp
       }
       setPreview(data as VideoInfo);
     } catch {
-      setError('Could not reach the local ResumeDL server.');
+      setError('Could not reach the server. Check your connection and try again.');
     } finally {
       setFetchingInfo(false);
     }
@@ -85,7 +85,7 @@ export function AddDownloadForm({ ytdlpInstalled, onAdded }: AddDownloadFormProp
       setThumbFailed(false);
       onAdded();
     } catch {
-      setError('Could not reach the local ResumeDL server.');
+      setError('Could not reach the server. Check your connection and try again.');
     } finally {
       setSubmitting(false);
     }
@@ -258,7 +258,7 @@ export function AddDownloadForm({ ytdlpInstalled, onAdded }: AddDownloadFormProp
           className="mt-4 flex items-start gap-2.5 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300"
         >
           <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-          <span>{error}</span>
+          <span className="whitespace-pre-line">{error}</span>
         </div>
       )}
     </section>

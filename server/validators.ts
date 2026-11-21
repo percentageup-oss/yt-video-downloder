@@ -123,6 +123,11 @@ export function formatBytes(bytes: number): string {
 export function mapYtDlpError(rawOutput: string): string {
   const text = rawOutput || '';
   const lower = text.toLowerCase();
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const errorLine = [...lines].reverse().find((l) => l.startsWith('ERROR:'));
 
   if (lower.includes('private video')) {
     return 'This video is private and cannot be downloaded.';
@@ -139,7 +144,10 @@ export function mapYtDlpError(rawOutput: string): string {
     return 'This video is age-restricted and requires signed-in YouTube cookies.';
   }
   if (lower.includes('confirm you’re not a bot') || lower.includes("confirm you're not a bot")) {
-    return 'YouTube requested bot verification. Try updating yt-dlp and retrying shortly.';
+    const rawLine = errorLine || lines[lines.length - 1] || '';
+    return rawLine
+      ? `YouTube is blocking this server's IP address.\n${rawLine.slice(0, 260)}`
+      : "YouTube is blocking this server's IP address.";
   }
   if (lower.includes('is not a valid url') || lower.includes('unsupported url')) {
     return 'Invalid or unsupported YouTube URL.';
@@ -150,15 +158,10 @@ export function mapYtDlpError(rawOutput: string): string {
   if (lower.includes('ffmpeg is not installed') || lower.includes('ffprobe and ffmpeg not found')) {
     return 'ffmpeg is missing. Install ffmpeg to merge video and audio or extract MP3 audio.';
   }
-  if (lower.includes('enoent') || lower.includes('not found')) {
+  if (lower.includes('enoent')) {
     return 'yt-dlp is not installed or not accessible in your system PATH.';
   }
 
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-  const errorLine = [...lines].reverse().find((l) => l.startsWith('ERROR:'));
   if (errorLine) {
     return errorLine.replace(/^ERROR:\s*/, '').slice(0, 260);
   }
