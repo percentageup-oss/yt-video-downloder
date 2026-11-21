@@ -1,0 +1,5 @@
+{
+  "name": "ResumeDL",
+  "description": "Local YouTube video and audio downloader with automatic network-drop pause and resume using yt-dlp and ffmpeg.",
+  "requestFramePermissions": []
+}
