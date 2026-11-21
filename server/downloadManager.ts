@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Response } from 'express';
-import type { DownloadItem, QualityPreset, VideoInfo } from './types.ts';
+import type { DownloadItem, QualityPreset, StorageStats, VideoInfo } from './types.ts';
 import {
   formatBytes,
   formatDuration,
@@ -16,7 +16,23 @@ import {
 export const DOWNLOADS_DIR = path.resolve(process.cwd(), 'downloads');
 export const STATE_FILE = path.resolve(process.cwd(), 'downloads.json');
 
-type StopReason = 'network' | 'manual' | 'cancel' | null;
+const parsedMaxMb = Number.parseInt(process.env.MAX_STORAGE_MB || '2048', 10);
+export const MAX_STORAGE_MB = Number.isFinite(parsedMaxMb) && parsedMaxMb >= 50 ? parsedMaxMb : 2048;
+export const MAX_STORAGE_BYTES = MAX_STORAGE_MB * 1024 * 1024;
+
+const parsedTtlMin = Number.parseInt(process.env.FILE_TTL_MINUTES || '60', 10);
+export const FILE_TTL_MINUTES =
+  Number.isFinite(parsedTtlMin) && parsedTtlMin >= 1 ? parsedTtlMin : 60;
+export const FILE_TTL_MS = FILE_TTL_MINUTES * 60 * 1000;
+
+export class StorageLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StorageLimitError';
+  }
+}
+
+type StopReason = 'network' | 'manual' | 'cancel' | 'storage' | null;
 
 const QUALITY_LABELS: Record<QualityPreset, string> = {
   best: 'Best (MP4)',
@@ -71,6 +87,7 @@ export class DownloadManager {
   private isOnline = true;
   private lastNetworkCheck = Date.now();
   private networkTimer: NodeJS.Timeout | null = null;
+  private cleanupTimer: NodeJS.Timeout | null = null;
   private checkingNetwork = false;
   private lastProgressPersist = 0;
 
@@ -80,6 +97,8 @@ export class DownloadManager {
   }
 
   public start(): void {
+    this.purgeExpiredFiles();
+
     // Check internet immediately on startup, then every 3 seconds
     void this.pollConnectivity().then(() => {
       if (this.isOnline) {
@@ -91,12 +110,21 @@ export class DownloadManager {
     this.networkTimer = setInterval(() => {
       void this.pollConnectivity();
     }, 3000);
+
+    // Check for expired files every 30 seconds (auto-delete 1 hour after fetch)
+    this.cleanupTimer = setInterval(() => {
+      this.purgeExpiredFiles();
+    }, 30000);
   }
 
   public stop(): void {
     if (this.networkTimer) {
       clearInterval(this.networkTimer);
       this.networkTimer = null;
+    }
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
     }
     if (this.activeChild) {
       this.stopReason = 'network';
@@ -106,6 +134,41 @@ export class DownloadManager {
 
   public getOnlineStatus(): { online: boolean; lastNetworkCheck: number } {
     return { online: this.isOnline, lastNetworkCheck: this.lastNetworkCheck };
+  }
+
+  public getStorageStats(): StorageStats {
+    let usedBytes = 0;
+    try {
+      if (fs.existsSync(DOWNLOADS_DIR)) {
+        const entries = fs.readdirSync(DOWNLOADS_DIR);
+        for (const entry of entries) {
+          const safePath = resolveSafeDownloadPath(DOWNLOADS_DIR, entry);
+          if (!safePath) continue;
+          try {
+            const stat = fs.statSync(safePath);
+            if (stat.isFile()) {
+              usedBytes += stat.size;
+            }
+          } catch {
+            // File may have been deleted concurrently
+          }
+        }
+      }
+    } catch {
+      // Ignore directory read errors
+    }
+
+    const usedPercent =
+      MAX_STORAGE_BYTES > 0
+        ? Math.min(100, Number(((usedBytes / MAX_STORAGE_BYTES) * 100).toFixed(1)))
+        : 0;
+
+    return {
+      usedBytes,
+      maxBytes: MAX_STORAGE_BYTES,
+      usedPercent,
+      fileTtlMinutes: FILE_TTL_MINUTES,
+    };
   }
 
   public getItems(): DownloadItem[] {
@@ -122,6 +185,7 @@ export class DownloadManager {
       items: this.items,
       online: this.isOnline,
       lastNetworkCheck: this.lastNetworkCheck,
+      storage: this.getStorageStats(),
     });
   }
 
@@ -149,11 +213,16 @@ export class DownloadManager {
       items: this.items,
       online: this.isOnline,
       lastNetworkCheck: this.lastNetworkCheck,
+      storage: this.getStorageStats(),
     });
   }
 
   private broadcastItem(item: DownloadItem): void {
     this.broadcast('item', item);
+  }
+
+  private broadcastStorage(): void {
+    this.broadcast('storage', this.getStorageStats());
   }
 
   private loadState(): void {
@@ -170,9 +239,15 @@ export class DownloadManager {
         return;
       }
       this.items = parsed.map((entry: DownloadItem) => {
-        if (entry.status === 'downloading' || entry.status === 'merging') {
+        const normalized: DownloadItem = {
+          ...entry,
+          firstFetchedAt: entry.firstFetchedAt ?? null,
+          expiresAt: entry.expiresAt ?? null,
+          fileDeleted: Boolean(entry.fileDeleted),
+        };
+        if (normalized.status === 'downloading' || normalized.status === 'merging') {
           return {
-            ...entry,
+            ...normalized,
             status: 'paused_network',
             statusText: 'Paused - waiting for network',
             speed: '0 B/s',
@@ -180,7 +255,7 @@ export class DownloadManager {
             updatedAt: Date.now(),
           };
         }
-        return entry;
+        return normalized;
       });
       this.saveState();
     } catch {
@@ -195,6 +270,56 @@ export class DownloadManager {
       fs.renameSync(tmp, STATE_FILE);
     } catch (err) {
       console.error('Failed to persist downloads.json:', err);
+    }
+  }
+
+  public purgeExpiredFiles(): void {
+    const now = Date.now();
+    let changed = false;
+
+    for (const item of this.items) {
+      if (item.status === 'done' && item.expiresAt !== null && now >= item.expiresAt && !item.fileDeleted) {
+        this.deleteFilesForItem(item);
+        item.outputFile = null;
+        item.fileDeleted = true;
+        item.statusText = `Auto-deleted (${FILE_TTL_MINUTES}m after fetch)`;
+        item.updatedAt = now;
+        changed = true;
+        this.broadcastItem(item);
+      }
+    }
+
+    if (changed) {
+      this.saveState();
+      this.broadcastStorage();
+    }
+  }
+
+  public markFileFetched(id: string): DownloadItem | null {
+    const item = this.getItem(id);
+    if (!item || item.status !== 'done' || !item.outputFile || item.fileDeleted) {
+      return null;
+    }
+
+    const now = Date.now();
+    if (!item.firstFetchedAt) {
+      item.firstFetchedAt = now;
+    }
+    // Schedule/refresh auto-deletion 1 hour after the file is fetched
+    item.expiresAt = now + FILE_TTL_MS;
+    item.updatedAt = now;
+    this.saveState();
+    this.broadcastItem(item);
+    return item;
+  }
+
+  private ensureStorageAvailable(): void {
+    this.purgeExpiredFiles();
+    const stats = this.getStorageStats();
+    if (stats.usedBytes >= stats.maxBytes) {
+      throw new StorageLimitError(
+        `Free storage limit reached (${formatBytes(stats.usedBytes)} / ${formatBytes(stats.maxBytes)}). Cancel or dismiss completed downloads to free space.`
+      );
     }
   }
 
@@ -355,14 +480,11 @@ export class DownloadManager {
     quality: QualityPreset;
     info?: Partial<VideoInfo>;
   }): Promise<DownloadItem> {
+    this.ensureStorageAvailable();
+
     let resolvedInfo: VideoInfo | null = null;
     if (!params.info?.title) {
-      try {
-        resolvedInfo = await this.fetchVideoInfo(params.url);
-      } catch (err) {
-        // Re-throw clear error (private/removed/bad URL/missing yt-dlp)
-        throw err;
-      }
+      resolvedInfo = await this.fetchVideoInfo(params.url);
     }
 
     const id = crypto.randomUUID().slice(0, 8);
@@ -394,6 +516,9 @@ export class DownloadManager {
       downloadedSize: '0 B',
       totalSize: '--',
       error: null,
+      firstFetchedAt: null,
+      expiresAt: null,
+      fileDeleted: false,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
@@ -444,7 +569,22 @@ export class DownloadManager {
   public resumeDownload(id: string): DownloadItem | null {
     const item = this.getItem(id);
     if (!item) return null;
-    if (item.status === 'done' || item.status === 'downloading' || item.status === 'merging') {
+    if (item.status === 'downloading' || item.status === 'merging') {
+      return item;
+    }
+
+    this.ensureStorageAvailable();
+
+    // Allow re-downloading an expired item cleanly
+    if (item.status === 'done' && item.fileDeleted) {
+      item.fileDeleted = false;
+      item.firstFetchedAt = null;
+      item.expiresAt = null;
+      item.outputFile = null;
+      item.percent = 0;
+      item.downloadedSize = '0 B';
+      item.totalSize = '--';
+    } else if (item.status === 'done') {
       return item;
     }
 
@@ -463,7 +603,7 @@ export class DownloadManager {
     return item;
   }
 
-  public async cancelDownload(id: string, deleteFiles: boolean): Promise<boolean> {
+  public async cancelDownload(id: string, keepFiles: boolean): Promise<boolean> {
     const idx = this.items.findIndex((i) => i.id === id);
     if (idx === -1) return false;
     const item = this.items[idx];
@@ -486,7 +626,7 @@ export class DownloadManager {
       });
     }
 
-    if (deleteFiles) {
+    if (!keepFiles) {
       this.deleteFilesForItem(item);
     }
 
@@ -528,7 +668,6 @@ export class DownloadManager {
           !name.includes('.temp.')
       );
       if (matches.length === 0) return null;
-      // Prefer mp4 or mp3 if multiple exist
       const preferred =
         matches.find((m) => m.endsWith('.mp4') || m.endsWith('.mp3')) ?? matches[0];
       return preferred;
@@ -542,9 +681,20 @@ export class DownloadManager {
       return;
     }
 
-    // Queue processes oldest queued item first (FIFO)
+    this.purgeExpiredFiles();
     const nextItem = [...this.items].reverse().find((i) => i.status === 'queued');
     if (!nextItem) return;
+
+    const stats = this.getStorageStats();
+    if (stats.usedBytes >= stats.maxBytes) {
+      nextItem.status = 'error';
+      nextItem.statusText = 'Error';
+      nextItem.error = `Free storage limit reached (${formatBytes(stats.usedBytes)} / ${formatBytes(stats.maxBytes)}). Free up space and retry.`;
+      nextItem.updatedAt = Date.now();
+      this.saveState();
+      this.broadcastSnapshot();
+      return;
+    }
 
     this.runYtDlp(nextItem);
   }
@@ -588,7 +738,6 @@ export class DownloadManager {
       const line = rawLine.trim();
       if (!line) return;
 
-      // Check Merger / ExtractAudio phases
       if (line.startsWith('[Merger]') || line.startsWith('[ffmpeg]')) {
         item.status = 'merging';
         item.statusText = 'Merging video & audio';
@@ -609,10 +758,6 @@ export class DownloadManager {
         return;
       }
 
-      // Parse standard yt-dlp --newline progress lines:
-      // [download]  45.2% of  150.00MiB at    3.20MiB/s ETA 00:25
-      // [download]  45.2% of ~ 150.00MiB at    3.20MiB/s ETA 00:25
-      // [download] 100% of  150.00MiB in 00:00:46 at    3.25MiB/s
       const progressMatch = line.match(
         /^\[download\]\s+([\d.]+)%\s+of\s+~?\s*([^\s]+)(?:\s+in\s+[^\s]+)?\s+at\s+([^\s]+(?:\s*B\/s)?)(?:\s+ETA\s+([^\s]+))?/i
       );
@@ -641,6 +786,17 @@ export class DownloadManager {
         if (Date.now() - this.lastProgressPersist > 3000) {
           this.lastProgressPersist = Date.now();
           this.saveState();
+          const stats = this.getStorageStats();
+          this.broadcast('storage', stats);
+          if (stats.usedBytes > stats.maxBytes && this.stopReason === null) {
+            this.stopReason = 'storage';
+            child.kill('SIGTERM');
+            setTimeout(() => {
+              if (!child.killed && child.exitCode === null) {
+                child.kill('SIGKILL');
+              }
+            }, 2000);
+          }
         }
         return;
       }
@@ -680,6 +836,11 @@ export class DownloadManager {
         item.statusText = 'Paused';
       } else if (this.stopReason === 'cancel') {
         return;
+      } else if (this.stopReason === 'storage') {
+        this.deleteFilesForItem(item);
+        item.status = 'error';
+        item.statusText = 'Error';
+        item.error = `Storage limit of ${MAX_STORAGE_MB} MB exceeded. Choose a smaller quality or free up space.`;
       } else {
         item.status = 'error';
         item.statusText = 'Error';
@@ -692,7 +853,7 @@ export class DownloadManager {
       item.eta = '--';
       item.updatedAt = Date.now();
       this.saveState();
-      this.broadcastItem(item);
+      this.broadcastSnapshot();
       this.processQueue();
     });
 
@@ -711,6 +872,22 @@ export class DownloadManager {
         return;
       }
 
+      if (reason === 'storage') {
+        this.deleteFilesForItem(item);
+        item.status = 'error';
+        item.statusText = 'Error';
+        item.speed = '--';
+        item.eta = '--';
+        item.percent = 0;
+        item.downloadedSize = '0 B';
+        item.error = `Free storage limit (${MAX_STORAGE_MB} MB) exceeded. Try a lower quality preset (e.g. 720p or 480p) or clear old downloads.`;
+        item.updatedAt = Date.now();
+        this.saveState();
+        this.broadcastSnapshot();
+        this.processQueue();
+        return;
+      }
+
       if (reason === 'network') {
         item.status = 'paused_network';
         item.statusText = 'Paused - waiting for network';
@@ -719,6 +896,7 @@ export class DownloadManager {
         item.updatedAt = Date.now();
         this.saveState();
         this.broadcastItem(item);
+        this.broadcastStorage();
         return;
       }
 
@@ -730,6 +908,7 @@ export class DownloadManager {
         item.updatedAt = Date.now();
         this.saveState();
         this.broadcastItem(item);
+        this.broadcastStorage();
         this.processQueue();
         return;
       }
@@ -752,14 +931,14 @@ export class DownloadManager {
         item.speed = '--';
         item.eta = '00:00';
         item.error = null;
+        item.fileDeleted = false;
         item.updatedAt = Date.now();
         this.saveState();
-        this.broadcastItem(item);
+        this.broadcastSnapshot();
         this.processQueue();
         return;
       }
 
-      // Unexpected non-zero exit: check if internet dropped before the 3s poller caught it
       const stillOnline = await this.checkInternet();
       if (!stillOnline || isNetworkErrorOutput(stderrBuffer)) {
         this.isOnline = stillOnline;
@@ -782,7 +961,7 @@ export class DownloadManager {
       item.error = mapYtDlpError(stderrBuffer);
       item.updatedAt = Date.now();
       this.saveState();
-      this.broadcastItem(item);
+      this.broadcastSnapshot();
       this.processQueue();
     });
   }

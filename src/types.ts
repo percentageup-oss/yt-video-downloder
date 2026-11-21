@@ -31,6 +31,9 @@ export interface DownloadItem {
   downloadedSize: string;
   totalSize: string;
   error: string | null;
+  firstFetchedAt: number | null;
+  expiresAt: number | null;
+  fileDeleted: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -51,12 +54,20 @@ export interface BinaryStatus {
   error?: string;
 }
 
+export interface StorageStats {
+  usedBytes: number;
+  maxBytes: number;
+  usedPercent: number;
+  fileTtlMinutes: number;
+}
+
 export interface SystemStatus {
   ytdlp: BinaryStatus;
   ffmpeg: BinaryStatus;
   online: boolean;
   lastNetworkCheck: number;
   downloadsDir: string;
+  storage: StorageStats;
 }
 
 export const QUALITY_OPTIONS: { value: QualityPreset; label: string }[] = [

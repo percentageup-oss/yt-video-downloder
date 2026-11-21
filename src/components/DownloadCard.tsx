@@ -30,6 +30,13 @@ function isSafeHttpUrl(raw: string): boolean {
   }
 }
 
+function formatExpiryRemaining(expiresAt: number): string {
+  const diffMs = expiresAt - Date.now();
+  if (diffMs <= 0) return 'Expiring soon';
+  const mins = Math.ceil(diffMs / 60000);
+  return `Auto-deletes in ${mins}m`;
+}
+
 function getStatusStyles(status: DownloadStatus): {
   badge: string;
   bar: string;
@@ -113,7 +120,9 @@ export function DownloadCard({
       ? 'Paused - waiting for network'
       : item.status === 'merging'
         ? item.statusText || 'Merging'
-        : styles.label;
+        : isDone && item.fileDeleted
+          ? 'Expired'
+          : styles.label;
 
   return (
     <article className="rounded-xl border border-white/[0.08] bg-[#121824] p-4 sm:p-5 transition-colors hover:border-white/[0.14]">
@@ -207,12 +216,16 @@ export function DownloadCard({
 
           {/* Completed file info & actions */}
           <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-            <div className="text-xs text-slate-500 truncate max-w-full sm:max-w-md font-mono">
-              {isDone && item.outputFile
-                ? `Saved: ./downloads/${item.outputFile}`
-                : isPaused
-                  ? 'Partial .part file preserved for resume'
-                  : ''}
+            <div className="text-xs text-slate-500 truncate max-w-full sm:max-w-md font-mono tabular-nums">
+              {isDone && item.fileDeleted
+                ? 'Auto-deleted 1h after fetch to save storage'
+                : isDone && item.outputFile
+                  ? item.expiresAt
+                    ? `${formatExpiryRemaining(item.expiresAt)} · ./downloads/${item.outputFile}`
+                    : `Ready (resumable HTTP Range) · ./downloads/${item.outputFile}`
+                  : isPaused
+                    ? 'Partial .part file preserved for resume'
+                    : ''}
             </div>
 
             <div className="flex flex-wrap items-center gap-2 ml-auto">
@@ -249,7 +262,18 @@ export function DownloadCard({
                 </button>
               )}
 
-              {isDone && item.outputFile && (
+              {isDone && item.fileDeleted && (
+                <button
+                  type="button"
+                  onClick={() => onResume(item.id)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition-colors whitespace-nowrap shrink-0 min-h-[40px] cursor-pointer"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  <span>Re-download</span>
+                </button>
+              )}
+
+              {isDone && item.outputFile && !item.fileDeleted && (
                 <a
                   href={`/api/downloads/${encodeURIComponent(item.id)}/file`}
                   download={item.outputFile}

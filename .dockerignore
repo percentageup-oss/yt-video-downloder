@@ -1,0 +1,9 @@
+node_modules
+dist
+downloads
+downloads.json
+downloads.json.tmp
+.git
+.env
+.env.local
+bun.lock

@@ -1,10 +1,10 @@
-import { CheckCircle2, FolderDown, Wifi, WifiOff, X } from 'lucide-react';
+import { CheckCircle2, FolderDown, HardDrive, Wifi, WifiOff, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AddDownloadForm } from './components/AddDownloadForm.tsx';
 import { DownloadCard } from './components/DownloadCard.tsx';
 import { Header } from './components/Header.tsx';
 import { SystemBanner } from './components/SystemBanner.tsx';
-import type { DownloadItem, FilterTab, SystemStatus } from './types.ts';
+import type { DownloadItem, FilterTab, StorageStats, SystemStatus } from './types.ts';
 
 const MOBILE_FILTERS: { id: FilterTab; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -14,9 +14,18 @@ const MOBILE_FILTERS: { id: FilterTab; label: string }[] = [
   { id: 'setup', label: 'Setup' },
 ];
 
+function formatClientBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  const exp = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const val = bytes / Math.pow(1024, exp);
+  return `${val >= 100 ? val.toFixed(0) : val >= 10 ? val.toFixed(1) : val.toFixed(2)} ${units[exp]}`;
+}
+
 export default function App() {
   const [items, setItems] = useState<DownloadItem[]>([]);
   const [online, setOnline] = useState<boolean>(true);
+  const [storage, setStorage] = useState<StorageStats | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [checkingSystem, setCheckingSystem] = useState(false);
   const [updatingYtDlp, setUpdatingYtDlp] = useState(false);
@@ -32,6 +41,7 @@ export default function App() {
         const data = (await res.json()) as SystemStatus;
         setSystemStatus(data);
         setOnline(data.online);
+        setStorage(data.storage);
       }
     } catch {
       // Ignore network hiccups during initial check
@@ -52,9 +62,13 @@ export default function App() {
         const payload = JSON.parse((event as MessageEvent).data) as {
           items: DownloadItem[];
           online: boolean;
+          storage?: StorageStats;
         };
         setItems(payload.items);
         setOnline(payload.online);
+        if (payload.storage) {
+          setStorage(payload.storage);
+        }
       } catch {
         // Ignore malformed SSE payload
       }
@@ -77,6 +91,15 @@ export default function App() {
       try {
         const payload = JSON.parse((event as MessageEvent).data) as { online: boolean };
         setOnline(payload.online);
+      } catch {
+        // Ignore malformed SSE payload
+      }
+    });
+
+    es.addEventListener('storage', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent).data) as StorageStats;
+        setStorage(payload);
       } catch {
         // Ignore malformed SSE payload
       }
@@ -189,7 +212,7 @@ export default function App() {
       />
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:px-6 sm:py-8 space-y-6">
-        {/* Live connectivity & environment telemetry strip */}
+        {/* Live connectivity, tool status & storage quota telemetry strip */}
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between border-b border-white/[0.07] pb-4 text-xs text-slate-400">
           <div className="flex flex-wrap items-center gap-2.5">
             {online ? (
@@ -207,19 +230,42 @@ export default function App() {
               ·
             </span>
             <span className="font-mono tabular-nums">
-              {systemStatus?.ytdlp.installed
-                ? `yt-dlp ${systemStatus.ytdlp.version}`
-                : 'yt-dlp missing'}
+              {systemStatus
+                ? systemStatus.ytdlp.installed
+                  ? `yt-dlp ${systemStatus.ytdlp.version}`
+                  : 'yt-dlp missing'
+                : 'checking yt-dlp...'}
             </span>
             <span aria-hidden="true" className="text-slate-600">
               ·
             </span>
             <span className="font-mono tabular-nums">
-              {systemStatus?.ffmpeg.installed ? 'ffmpeg ready' : 'ffmpeg missing'}
+              {systemStatus
+                ? systemStatus.ffmpeg.installed
+                  ? 'ffmpeg ready'
+                  : 'ffmpeg missing'
+                : 'checking ffmpeg...'}
             </span>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 font-mono tabular-nums text-slate-400">
+            {storage && (
+              <>
+                <span
+                  className={`inline-flex items-center gap-1.5 ${
+                    storage.usedPercent >= 90 ? 'text-amber-400' : 'text-slate-300'
+                  }`}
+                >
+                  <HardDrive className="h-3.5 w-3.5" />
+                  <span>
+                    {formatClientBytes(storage.usedBytes)} / {formatClientBytes(storage.maxBytes)}
+                  </span>
+                </span>
+                <span aria-hidden="true" className="text-slate-600">
+                  ·
+                </span>
+              </>
+            )}
             <span>{counts.active} active</span>
             <span aria-hidden="true" className="text-slate-600">
               ·
@@ -259,7 +305,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Missing dependency instructions or Setup Guide tab */}
+        {/* Missing dependency instructions (only shown if yt-dlp/ffmpeg is really missing or Setup Guide clicked) */}
         <SystemBanner
           status={systemStatus}
           checking={checkingSystem}
@@ -323,7 +369,7 @@ export default function App() {
               </span>
             </h2>
             <span className="text-xs text-slate-500 font-mono hidden sm:inline">
-              Saving to ./downloads
+              Files auto-delete {storage?.fileTtlMinutes ?? 60}m after fetch
             </span>
           </div>
 

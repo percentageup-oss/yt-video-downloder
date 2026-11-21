@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import type { BinaryStatus, SystemStatus } from './types.ts';
+import type { BinaryStatus, StorageStats, SystemStatus } from './types.ts';
 
 function checkBinary(command: string, args: string[]): Promise<BinaryStatus> {
   return new Promise((resolve) => {
@@ -43,7 +43,10 @@ function checkBinary(command: string, args: string[]): Promise<BinaryStatus> {
       if (code === 0) {
         const firstLine = stdout.split(/\r?\n/)[0]?.trim() || 'installed';
         const versionMatch = firstLine.match(/(?:ffmpeg version\s+)?([^\s,]+)/i);
-        const version = command === 'ffmpeg' ? (firstLine.match(/ffmpeg version\s+([^\s]+)/i)?.[1] ?? firstLine) : (versionMatch?.[1] ?? firstLine);
+        const version =
+          command === 'ffmpeg'
+            ? (firstLine.match(/ffmpeg version\s+([^\s]+)/i)?.[1] ?? firstLine)
+            : (versionMatch?.[1] ?? firstLine);
         resolve({ installed: true, version });
       } else {
         resolve({
@@ -59,7 +62,8 @@ function checkBinary(command: string, args: string[]): Promise<BinaryStatus> {
 export async function getSystemStatus(
   online: boolean,
   lastNetworkCheck: number,
-  downloadsDir: string
+  downloadsDir: string,
+  storage: StorageStats
 ): Promise<SystemStatus> {
   const [ytdlp, ffmpeg] = await Promise.all([
     checkBinary('yt-dlp', ['--version']),
@@ -72,6 +76,7 @@ export async function getSystemStatus(
     online,
     lastNetworkCheck,
     downloadsDir,
+    storage,
   };
 }
 
@@ -125,7 +130,9 @@ export function updateYtDlp(): Promise<{ ok: boolean; output: string; version: s
       const status = await checkBinary('yt-dlp', ['--version']);
       resolve({
         ok: code === 0,
-        output: combined || (code === 0 ? 'yt-dlp updated successfully.' : `yt-dlp -U exited with code ${code}.`),
+        output:
+          combined ||
+          (code === 0 ? 'yt-dlp updated successfully.' : `yt-dlp -U exited with code ${code}.`),
         version: status.version,
       });
     });
